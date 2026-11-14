@@ -1,0 +1,62 @@
+name: Build GuardLauncher (x64 Zero-CRT)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile GuardLauncher.exe (Zero-CRT)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          cl.exe /nologo /O2 /W4 /utf-8 /GS- /Zl /Gs65536 `
+            src/GuardLauncher.cpp `
+            /Fo:dist/GuardLauncher.obj `
+            /Fe:dist/GuardLauncher.exe `
+            /link /SUBSYSTEM:WINDOWS /NODEFAULTLIB /ENTRY:wWinMainCRTStartup `
+            /STACK:0x100000,0x10000 /OPT:REF /OPT:ICF kernel32.lib
+
+          Remove-Item dist/GuardLauncher.obj -Force
+          Copy-Item scripts/*.bat dist/ -Force
+
+      - name: Verify PE Imports and Size
+        shell: pwsh
+        run: |
+          $file = Get-Item dist/GuardLauncher.exe
+          Write-Host "Output Size: $($file.Length) bytes"
+          dumpbin.exe /imports dist/GuardLauncher.exe
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GuardLauncher-x64
+          path: dist/
+          retention-days: 30
+
+      - name: Create Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/GuardLauncher.exe
+            dist/install.bat
+            dist/uninstall.bat
