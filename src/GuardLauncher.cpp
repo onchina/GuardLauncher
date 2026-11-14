@@ -9,8 +9,11 @@
 #define STARTF_TITLEISLINKNAME 0x00000800
 #endif
 
+#ifndef STATUS_OBJECT_NAME_NOT_FOUND
+#define STATUS_OBJECT_NAME_NOT_FOUND ((DWORD)0xC0000034L)
+#endif
+
 // ===================== 0. Zero-CRT 编译器内在函数支持 =====================
-// 满足 MSVC /O2 优化器对结构体清零与拷贝自动生成的 memset / memcpy 外部符号引用
 #pragma function(memset, memcpy)
 extern "C" void* __cdecl memset(void* dst, int val, size_t count) {
     unsigned char* p = (unsigned char*)dst;
@@ -47,7 +50,6 @@ static int MyWcsNCmp(const wchar_t* s1, const wchar_t* s2, size_t n) {
     return 0;
 }
 
-// 提取命令行中的单个参数（遵循 Windows 引号与反斜杠转义规则），并输出下一个参数的起始位置
 static bool NextCmdArg(const wchar_t* p, wchar_t* outBuf, size_t maxChars, const wchar_t** nextPos) {
     while (*p == L' ' || *p == L'\t') ++p;
     if (*p == L'\0') {
@@ -97,7 +99,6 @@ static bool NextCmdArg(const wchar_t* p, wchar_t* outBuf, size_t maxChars, const
     return true;
 }
 
-// 判断字符串是否以 .exe 结尾
 static bool EndsWithExe(const wchar_t* s) {
     if (!s) return false;
     int len = lstrlenW(s);
@@ -105,7 +106,6 @@ static bool EndsWithExe(const wchar_t* s) {
     return CompareStringOrdinal(s + len - 4, 4, L".exe", 4, TRUE) == CSTR_EQUAL;
 }
 
-// 判断短名称（如 "chrome"）是否与完整 exe 路径（如 "C:\...\chrome.exe"）的文件名主干一致
 static bool MatchesExeStem(const wchar_t* shortArg, const wchar_t* fullExePath) {
     if (!shortArg || !fullExePath) return false;
     const wchar_t* base = fullExePath;
@@ -119,7 +119,6 @@ static bool MatchesExeStem(const wchar_t* shortArg, const wchar_t* fullExePath) 
     return CompareStringOrdinal(shortArg, stemLen, base, stemLen, TRUE) == CSTR_EQUAL;
 }
 
-// 判断路径末尾文件名是否为 MDMRegistration.dll
 static bool IsMdmFileName(const wchar_t* path) {
     if (!path || !*path) return false;
     const wchar_t* base = path;
@@ -129,7 +128,6 @@ static bool IsMdmFileName(const wchar_t* path) {
     return lstrcmpiW(base, L"MDMRegistration.dll") == 0;
 }
 
-// 向缓冲区追加带双引号包裹的程序路径
 static void AppendQuotedArg(wchar_t* dst, size_t maxChars, size_t& pos, const wchar_t* arg) {
     if (pos + 4 >= maxChars) return;
     if (pos > 0) dst[pos++] = L' ';
@@ -142,7 +140,7 @@ static void AppendQuotedArg(wchar_t* dst, size_t maxChars, size_t& pos, const wc
     dst[pos] = L'\0';
 }
 
-// ===================== 2. MDMRegistration 断点接管逻辑 =====================
+// ===================== 2. 断点接管逻辑（MDM 策略 + 子进程 IFEO 屏蔽） =====================
 
 static uintptr_t g_cachedMdmRva = 0;
 
@@ -158,6 +156,17 @@ static uintptr_t GetMdmFuncRva() {
     }
     FreeLibrary(hMdm);
     return g_cachedMdmRva;
+}
+
+// 获取 ntdll!LdrQueryImageFileExecutionOptionsEx 地址（同系统下 ntdll 映射基址全进程一致）
+static uintptr_t GetLdrQueryIfeoAddr() {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return 0;
+    FARPROC pFn = GetProcAddress(hNtdll, "LdrQueryImageFileExecutionOptionsEx");
+    if (!pFn) {
+        pFn = GetProcAddress(hNtdll, "LdrQueryImageFileExecutionOptions");
+    }
+    return (uintptr_t)pFn;
 }
 
 static bool IsMdmRegistrationDll(HANDLE hProcess, const LOAD_DLL_DEBUG_INFO& info) {
@@ -192,6 +201,54 @@ static bool IsMdmRegistrationDll(HANDLE hProcess, const LOAD_DLL_DEBUG_INFO& inf
     }
 
     return false;
+}
+
+// 处理 LdrQueryImageFileExecutionOptionsEx(SubKey, ValueName, ...) 断点：
+// 当浏览器主进程创建子进程查询 "Debugger" 键值时，返回 STATUS_OBJECT_NAME_NOT_FOUND 以跳过 IFEO
+static bool HandleIfeoQueryBreakpoint(
+    HANDLE hProcess,
+    DWORD dwThreadId,
+    uintptr_t ldrFuncAddr,
+    const BYTE origBytes[2],
+    DWORD& outSingleStepThreadId) {
+    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, dwThreadId);
+    if (!hThread) return false;
+
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+    if (!GetThreadContext(hThread, &ctx)) {
+        CloseHandle(hThread);
+        return false;
+    }
+
+    // x64 调用约定：RCX = PUNICODE_STRING SubKey, RDX = PCWSTR ValueName
+    wchar_t valName[16] = { 0 };
+    bool isDebuggerQuery = false;
+    if (ctx.Rdx != 0 &&
+        ReadProcessMemory(hProcess, (LPCVOID)ctx.Rdx, valName, sizeof(valName) - sizeof(wchar_t), nullptr)) {
+        valName[ARRAYSIZE(valName) - 1] = L'\0';
+        if (lstrcmpiW(valName, L"Debugger") == 0) {
+            isDebuggerQuery = true;
+        }
+    }
+
+    if (isDebuggerQuery) {
+        // 拦截 "Debugger" 查询，执行紧随其后的 0xC3 (RET) 并返回 STATUS_OBJECT_NAME_NOT_FOUND
+        ctx.Rip = ldrFuncAddr + 1;
+        ctx.Rax = (ULONG_PTR)STATUS_OBJECT_NAME_NOT_FOUND;
+        outSingleStepThreadId = 0;
+    } else {
+        // 其他查询（如 GlobalFlag / MitigationOptions）：临时恢复原 2 字节并用单步标志放行原指令
+        WriteProcessMemory(hProcess, (LPVOID)ldrFuncAddr, origBytes, 2, nullptr);
+        FlushInstructionCache(hProcess, (LPVOID)ldrFuncAddr, 2);
+        ctx.Rip = ldrFuncAddr;
+        ctx.EFlags |= 0x100; // Trap Flag (单步执行 1 条指令后触发 EXCEPTION_SINGLE_STEP 重新下断)
+        outSingleStepThreadId = dwThreadId;
+    }
+
+    SetThreadContext(hThread, &ctx);
+    CloseHandle(hThread);
+    return true;
 }
 
 static bool HandleMdmBreakpoint(HANDLE hProcess, DWORD dwThreadId, uintptr_t retInstAddr) {
@@ -264,7 +321,9 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
 
     PROCESS_INFORMATION pi = { 0 };
     LPCWSTR applicationName = (appPath && (MyWcsChr(appPath, L'\\') || MyWcsChr(appPath, L'/'))) ? appPath : nullptr;
-    DWORD createFlags = isChildProcess ? DEBUG_ONLY_THIS_PROCESS : DEBUG_PROCESS;
+
+    // 仅调试当前主进程，并在挂起状态下先部署断点再恢复运行
+    DWORD createFlags = DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED;
 
     if (!CreateProcessW(
             applicationName,
@@ -287,14 +346,33 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
 
     if (isChildProcess || isTargetWow64) {
         DebugActiveProcessStop(pi.dwProcessId);
+        ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         return;
     }
 
+    // 在主进程开始执行前，在 ntdll!LdrQueryImageFileExecutionOptionsEx 部署断点屏蔽子进程 IFEO
+    uintptr_t ldrIfeoAddr = GetLdrQueryIfeoAddr();
+    BYTE origLdrBytes[2] = { 0 };
+    bool ldrHooked = false;
+
+    if (ldrIfeoAddr != 0 &&
+        ReadProcessMemory(pi.hProcess, (LPCVOID)ldrIfeoAddr, origLdrBytes, sizeof(origLdrBytes), nullptr)) {
+        BYTE patch[2] = { 0xCC, 0xC3 };
+        if (WriteProcessMemory(pi.hProcess, (LPVOID)ldrIfeoAddr, patch, sizeof(patch), nullptr)) {
+            FlushInstructionCache(pi.hProcess, (LPVOID)ldrIfeoAddr, sizeof(patch));
+            ldrHooked = true;
+        }
+    }
+
+    // 恢复主进程执行
+    ResumeThread(pi.hThread);
+
     DEBUG_EVENT ev = { 0 };
     LPVOID remoteMdmBase = nullptr;
-    uintptr_t remoteFuncAddr = 0;
+    uintptr_t remoteMdmFuncAddr = 0;
+    DWORD singleStepThreadId = 0;
     bool initialBreakpointSeen = false;
 
     while (WaitForDebugEvent(&ev, INFINITE)) {
@@ -305,30 +383,20 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
             if (ev.u.CreateProcessInfo.hFile) {
                 CloseHandle(ev.u.CreateProcessInfo.hFile);
             }
-            if (ev.dwProcessId != pi.dwProcessId) {
-                if (ev.u.CreateProcessInfo.hThread) {
-                    CloseHandle(ev.u.CreateProcessInfo.hThread);
-                }
-                if (ev.u.CreateProcessInfo.hProcess) {
-                    CloseHandle(ev.u.CreateProcessInfo.hProcess);
-                }
-                DebugActiveProcessStop(ev.dwProcessId);
-                continue;
-            }
             break;
 
         case LOAD_DLL_DEBUG_EVENT:
-            if (ev.dwProcessId == pi.dwProcessId && remoteFuncAddr == 0 &&
+            if (ev.dwProcessId == pi.dwProcessId && remoteMdmFuncAddr == 0 &&
                 IsMdmRegistrationDll(pi.hProcess, ev.u.LoadDll)) {
                 uintptr_t rva = GetMdmFuncRva();
                 if (rva != 0) {
                     remoteMdmBase = ev.u.LoadDll.lpBaseOfDll;
-                    remoteFuncAddr = (uintptr_t)remoteMdmBase + rva;
+                    remoteMdmFuncAddr = (uintptr_t)remoteMdmBase + rva;
                     BYTE patch[2] = { 0xCC, 0xC3 };
-                    if (WriteProcessMemory(pi.hProcess, (LPVOID)remoteFuncAddr, patch, sizeof(patch), nullptr)) {
-                        FlushInstructionCache(pi.hProcess, (LPVOID)remoteFuncAddr, sizeof(patch));
+                    if (WriteProcessMemory(pi.hProcess, (LPVOID)remoteMdmFuncAddr, patch, sizeof(patch), nullptr)) {
+                        FlushInstructionCache(pi.hProcess, (LPVOID)remoteMdmFuncAddr, sizeof(patch));
                     } else {
-                        remoteFuncAddr = 0;
+                        remoteMdmFuncAddr = 0;
                     }
                 }
             }
@@ -340,7 +408,7 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
         case UNLOAD_DLL_DEBUG_EVENT:
             if (ev.dwProcessId == pi.dwProcessId && ev.u.UnloadDll.lpBaseOfDll == remoteMdmBase) {
                 remoteMdmBase = nullptr;
-                remoteFuncAddr = 0;
+                remoteMdmFuncAddr = 0;
             }
             break;
 
@@ -349,8 +417,11 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
             uintptr_t addr = (uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress;
 
             if (code == EXCEPTION_BREAKPOINT) {
-                if (ev.dwProcessId == pi.dwProcessId && remoteFuncAddr != 0 && addr == remoteFuncAddr) {
-                    HandleMdmBreakpoint(pi.hProcess, ev.dwThreadId, remoteFuncAddr + 1);
+                if (ev.dwProcessId == pi.dwProcessId && ldrHooked && addr == ldrIfeoAddr) {
+                    HandleIfeoQueryBreakpoint(pi.hProcess, ev.dwThreadId, ldrIfeoAddr, origLdrBytes, singleStepThreadId);
+                    continueStatus = DBG_CONTINUE;
+                } else if (ev.dwProcessId == pi.dwProcessId && remoteMdmFuncAddr != 0 && addr == remoteMdmFuncAddr) {
+                    HandleMdmBreakpoint(pi.hProcess, ev.dwThreadId, remoteMdmFuncAddr + 1);
                     continueStatus = DBG_CONTINUE;
                 } else if (ev.dwProcessId == pi.dwProcessId && !initialBreakpointSeen) {
                     initialBreakpointSeen = true;
@@ -358,6 +429,16 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
                 } else {
                     continueStatus = DBG_EXCEPTION_NOT_HANDLED;
                 }
+            } else if (code == EXCEPTION_SINGLE_STEP &&
+                       ev.dwProcessId == pi.dwProcessId &&
+                       singleStepThreadId != 0 &&
+                       ev.dwThreadId == singleStepThreadId) {
+                // 单步放行 1 条原指令后，立即重新写入 0xCC, 0xC3 断点
+                BYTE patch[2] = { 0xCC, 0xC3 };
+                WriteProcessMemory(pi.hProcess, (LPVOID)ldrIfeoAddr, patch, sizeof(patch), nullptr);
+                FlushInstructionCache(pi.hProcess, (LPVOID)ldrIfeoAddr, sizeof(patch));
+                singleStepThreadId = 0;
+                continueStatus = DBG_CONTINUE;
             } else {
                 continueStatus = DBG_EXCEPTION_NOT_HANDLED;
             }
