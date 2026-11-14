@@ -50,6 +50,22 @@ static int MyWcsNCmp(const wchar_t* s1, const wchar_t* s2, size_t n) {
     return 0;
 }
 
+// 不区分大小写判断 haystack 中是否包含 needle
+static bool ContainsSubstrI(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle) return false;
+    int hLen = lstrlenW(haystack);
+    int nLen = lstrlenW(needle);
+    if (nLen == 0) return true;
+    if (hLen < nLen) return false;
+
+    for (int i = 0; i <= hLen - nLen; ++i) {
+        if (CompareStringOrdinal(haystack + i, nLen, needle, nLen, TRUE) == CSTR_EQUAL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool NextCmdArg(const wchar_t* p, wchar_t* outBuf, size_t maxChars, const wchar_t** nextPos) {
     while (*p == L' ' || *p == L'\t') ++p;
     if (*p == L'\0') {
@@ -140,7 +156,112 @@ static void AppendQuotedArg(wchar_t* dst, size_t maxChars, size_t& pos, const wc
     dst[pos] = L'\0';
 }
 
-// ===================== 2. 断点接管逻辑（MDM 策略 + 子进程 IFEO 屏蔽） =====================
+// ===================== 2. 无锁跳板 Hook（屏蔽子进程 IFEO + 接管 MDM 策略） =====================
+
+struct REMOTE_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    USHORT Padding[2];
+    ULONG_PTR Buffer;
+};
+
+struct REMOTE_OBJECT_ATTRIBUTES {
+    ULONG Length;
+    ULONG Padding;
+    ULONG_PTR RootDirectory;
+    ULONG_PTR ObjectName;
+};
+
+struct SyscallHookSlot {
+    uintptr_t targetAddr;
+    uintptr_t trampolineAddr;
+};
+
+// 为 ntdll 系统调用存根安装无锁跳板 Hook：
+// 备份开头 8 字节 (4C 8B D1 B8 xx xx xx xx = mov r10, rcx; mov eax, SSN) 至远程跳板，
+// 原函数入口写入 0xCC, 0xC3 (INT 3; RET)，多线程并发调用无需恢复原字节，绝对安全
+static bool InstallNtSyscallHook(HANDLE hProcess, uintptr_t funcAddr, uintptr_t remoteTrampoline) {
+    if (!funcAddr || !remoteTrampoline) return false;
+
+    BYTE orig[8] = { 0 };
+    if (!ReadProcessMemory(hProcess, (LPCVOID)funcAddr, orig, sizeof(orig), nullptr)) {
+        return false;
+    }
+
+    // 校验是否为标准 x64 ntdll syscall stub 前缀: mov r10, rcx (4C 8B D1) + mov eax, imm32 (B8)
+    if (orig[0] != 0x4C || orig[1] != 0x8B || orig[2] != 0xD1 || orig[3] != 0xB8) {
+        return false;
+    }
+
+    BYTE tramp[22] = { 0 };
+    memcpy(tramp, orig, 8);
+    // jmp qword ptr [rip + 0]
+    tramp[8] = 0xFF;
+    tramp[9] = 0x25;
+    uintptr_t resumeAddr = funcAddr + 8;
+    memcpy(tramp + 14, &resumeAddr, sizeof(resumeAddr));
+
+    if (!WriteProcessMemory(hProcess, (LPVOID)remoteTrampoline, tramp, sizeof(tramp), nullptr)) {
+        return false;
+    }
+
+    BYTE patch[2] = { 0xCC, 0xC3 };
+    if (!WriteProcessMemory(hProcess, (LPVOID)funcAddr, patch, sizeof(patch), nullptr)) {
+        return false;
+    }
+
+    FlushInstructionCache(hProcess, (LPVOID)remoteTrampoline, sizeof(tramp));
+    FlushInstructionCache(hProcess, (LPVOID)funcAddr, sizeof(patch));
+    return true;
+}
+
+// 拦截 NtOpenKeyEx / NtOpenKey：第 3 个参数 R8 为 POBJECT_ATTRIBUTES
+static bool HandleNtOpenKeyBreakpoint(HANDLE hProcess, DWORD dwThreadId, const SyscallHookSlot& slot) {
+    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, dwThreadId);
+    if (!hThread) return false;
+
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+    if (!GetThreadContext(hThread, &ctx)) {
+        CloseHandle(hThread);
+        return false;
+    }
+
+    bool blockIfeo = false;
+    if (ctx.R8 != 0) {
+        REMOTE_OBJECT_ATTRIBUTES oa = { 0 };
+        if (ReadProcessMemory(hProcess, (LPCVOID)ctx.R8, &oa, sizeof(oa), nullptr) && oa.ObjectName != 0) {
+            REMOTE_UNICODE_STRING us = { 0 };
+            if (ReadProcessMemory(hProcess, (LPCVOID)oa.ObjectName, &us, sizeof(us), nullptr) &&
+                us.Length > 0 && us.Buffer != 0) {
+                wchar_t keyPath[512] = { 0 };
+                size_t toRead = us.Length;
+                if (toRead > sizeof(keyPath) - sizeof(wchar_t)) {
+                    toRead = sizeof(keyPath) - sizeof(wchar_t);
+                }
+                if (ReadProcessMemory(hProcess, (LPCVOID)us.Buffer, keyPath, toRead, nullptr)) {
+                    keyPath[toRead / sizeof(wchar_t)] = L'\0';
+                    if (ContainsSubstrI(keyPath, L"Image File Execution Options")) {
+                        blockIfeo = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (blockIfeo) {
+        // 拦截 IFEO 注册表查询：直接跳转至 targetAddr + 1 (0xC3 RET) 并返回 STATUS_OBJECT_NAME_NOT_FOUND
+        ctx.Rip = slot.targetAddr + 1;
+        ctx.Rax = (ULONG_PTR)STATUS_OBJECT_NAME_NOT_FOUND;
+    } else {
+        // 普通注册表查询：直接跳转至跳板执行原系统调用，零锁零竞争
+        ctx.Rip = slot.trampolineAddr;
+    }
+
+    SetThreadContext(hThread, &ctx);
+    CloseHandle(hThread);
+    return true;
+}
 
 static uintptr_t g_cachedMdmRva = 0;
 
@@ -156,17 +277,6 @@ static uintptr_t GetMdmFuncRva() {
     }
     FreeLibrary(hMdm);
     return g_cachedMdmRva;
-}
-
-// 获取 ntdll!LdrQueryImageFileExecutionOptionsEx 地址（同系统下 ntdll 映射基址全进程一致）
-static uintptr_t GetLdrQueryIfeoAddr() {
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (!hNtdll) return 0;
-    FARPROC pFn = GetProcAddress(hNtdll, "LdrQueryImageFileExecutionOptionsEx");
-    if (!pFn) {
-        pFn = GetProcAddress(hNtdll, "LdrQueryImageFileExecutionOptions");
-    }
-    return (uintptr_t)pFn;
 }
 
 static bool IsMdmRegistrationDll(HANDLE hProcess, const LOAD_DLL_DEBUG_INFO& info) {
@@ -201,54 +311,6 @@ static bool IsMdmRegistrationDll(HANDLE hProcess, const LOAD_DLL_DEBUG_INFO& inf
     }
 
     return false;
-}
-
-// 处理 LdrQueryImageFileExecutionOptionsEx(SubKey, ValueName, ...) 断点：
-// 当浏览器主进程创建子进程查询 "Debugger" 键值时，返回 STATUS_OBJECT_NAME_NOT_FOUND 以跳过 IFEO
-static bool HandleIfeoQueryBreakpoint(
-    HANDLE hProcess,
-    DWORD dwThreadId,
-    uintptr_t ldrFuncAddr,
-    const BYTE origBytes[2],
-    DWORD& outSingleStepThreadId) {
-    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, dwThreadId);
-    if (!hThread) return false;
-
-    CONTEXT ctx = { 0 };
-    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-    if (!GetThreadContext(hThread, &ctx)) {
-        CloseHandle(hThread);
-        return false;
-    }
-
-    // x64 调用约定：RCX = PUNICODE_STRING SubKey, RDX = PCWSTR ValueName
-    wchar_t valName[16] = { 0 };
-    bool isDebuggerQuery = false;
-    if (ctx.Rdx != 0 &&
-        ReadProcessMemory(hProcess, (LPCVOID)ctx.Rdx, valName, sizeof(valName) - sizeof(wchar_t), nullptr)) {
-        valName[ARRAYSIZE(valName) - 1] = L'\0';
-        if (lstrcmpiW(valName, L"Debugger") == 0) {
-            isDebuggerQuery = true;
-        }
-    }
-
-    if (isDebuggerQuery) {
-        // 拦截 "Debugger" 查询，执行紧随其后的 0xC3 (RET) 并返回 STATUS_OBJECT_NAME_NOT_FOUND
-        ctx.Rip = ldrFuncAddr + 1;
-        ctx.Rax = (ULONG_PTR)STATUS_OBJECT_NAME_NOT_FOUND;
-        outSingleStepThreadId = 0;
-    } else {
-        // 其他查询（如 GlobalFlag / MitigationOptions）：临时恢复原 2 字节并用单步标志放行原指令
-        WriteProcessMemory(hProcess, (LPVOID)ldrFuncAddr, origBytes, 2, nullptr);
-        FlushInstructionCache(hProcess, (LPVOID)ldrFuncAddr, 2);
-        ctx.Rip = ldrFuncAddr;
-        ctx.EFlags |= 0x100; // Trap Flag (单步执行 1 条指令后触发 EXCEPTION_SINGLE_STEP 重新下断)
-        outSingleStepThreadId = dwThreadId;
-    }
-
-    SetThreadContext(hThread, &ctx);
-    CloseHandle(hThread);
-    return true;
 }
 
 static bool HandleMdmBreakpoint(HANDLE hProcess, DWORD dwThreadId, uintptr_t retInstAddr) {
@@ -322,7 +384,6 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
     PROCESS_INFORMATION pi = { 0 };
     LPCWSTR applicationName = (appPath && (MyWcsChr(appPath, L'\\') || MyWcsChr(appPath, L'/'))) ? appPath : nullptr;
 
-    // 仅调试当前主进程，并在挂起状态下先部署断点再恢复运行
     DWORD createFlags = DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED;
 
     if (!CreateProcessW(
@@ -352,27 +413,31 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
         return;
     }
 
-    // 在主进程开始执行前，在 ntdll!LdrQueryImageFileExecutionOptionsEx 部署断点屏蔽子进程 IFEO
-    uintptr_t ldrIfeoAddr = GetLdrQueryIfeoAddr();
-    BYTE origLdrBytes[2] = { 0 };
-    bool ldrHooked = false;
+    // 在主进程分配 1 页可执行跳板内存，用于无锁转发 NtOpenKeyEx / NtOpenKey
+    SyscallHookSlot hookOpenKeyEx = { 0 };
+    SyscallHookSlot hookOpenKey = { 0 };
 
-    if (ldrIfeoAddr != 0 &&
-        ReadProcessMemory(pi.hProcess, (LPCVOID)ldrIfeoAddr, origLdrBytes, sizeof(origLdrBytes), nullptr)) {
-        BYTE patch[2] = { 0xCC, 0xC3 };
-        if (WriteProcessMemory(pi.hProcess, (LPVOID)ldrIfeoAddr, patch, sizeof(patch), nullptr)) {
-            FlushInstructionCache(pi.hProcess, (LPVOID)ldrIfeoAddr, sizeof(patch));
-            ldrHooked = true;
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    LPVOID remotePage = VirtualAllocEx(pi.hProcess, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (hNtdll && remotePage) {
+        uintptr_t pOpenKeyEx = (uintptr_t)GetProcAddress(hNtdll, "NtOpenKeyEx");
+        if (InstallNtSyscallHook(pi.hProcess, pOpenKeyEx, (uintptr_t)remotePage)) {
+            hookOpenKeyEx.targetAddr = pOpenKeyEx;
+            hookOpenKeyEx.trampolineAddr = (uintptr_t)remotePage;
+        }
+
+        uintptr_t pOpenKey = (uintptr_t)GetProcAddress(hNtdll, "NtOpenKey");
+        if (InstallNtSyscallHook(pi.hProcess, pOpenKey, (uintptr_t)remotePage + 0x40)) {
+            hookOpenKey.targetAddr = pOpenKey;
+            hookOpenKey.trampolineAddr = (uintptr_t)remotePage + 0x40;
         }
     }
 
-    // 恢复主进程执行
     ResumeThread(pi.hThread);
 
     DEBUG_EVENT ev = { 0 };
     LPVOID remoteMdmBase = nullptr;
     uintptr_t remoteMdmFuncAddr = 0;
-    DWORD singleStepThreadId = 0;
     bool initialBreakpointSeen = false;
 
     while (WaitForDebugEvent(&ev, INFINITE)) {
@@ -417,8 +482,11 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
             uintptr_t addr = (uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress;
 
             if (code == EXCEPTION_BREAKPOINT) {
-                if (ev.dwProcessId == pi.dwProcessId && ldrHooked && addr == ldrIfeoAddr) {
-                    HandleIfeoQueryBreakpoint(pi.hProcess, ev.dwThreadId, ldrIfeoAddr, origLdrBytes, singleStepThreadId);
+                if (ev.dwProcessId == pi.dwProcessId && hookOpenKeyEx.targetAddr != 0 && addr == hookOpenKeyEx.targetAddr) {
+                    HandleNtOpenKeyBreakpoint(pi.hProcess, ev.dwThreadId, hookOpenKeyEx);
+                    continueStatus = DBG_CONTINUE;
+                } else if (ev.dwProcessId == pi.dwProcessId && hookOpenKey.targetAddr != 0 && addr == hookOpenKey.targetAddr) {
+                    HandleNtOpenKeyBreakpoint(pi.hProcess, ev.dwThreadId, hookOpenKey);
                     continueStatus = DBG_CONTINUE;
                 } else if (ev.dwProcessId == pi.dwProcessId && remoteMdmFuncAddr != 0 && addr == remoteMdmFuncAddr) {
                     HandleMdmBreakpoint(pi.hProcess, ev.dwThreadId, remoteMdmFuncAddr + 1);
@@ -429,16 +497,6 @@ static void LaunchTarget(const wchar_t* appPath, wchar_t* cmdLine, const STARTUP
                 } else {
                     continueStatus = DBG_EXCEPTION_NOT_HANDLED;
                 }
-            } else if (code == EXCEPTION_SINGLE_STEP &&
-                       ev.dwProcessId == pi.dwProcessId &&
-                       singleStepThreadId != 0 &&
-                       ev.dwThreadId == singleStepThreadId) {
-                // 单步放行 1 条原指令后，立即重新写入 0xCC, 0xC3 断点
-                BYTE patch[2] = { 0xCC, 0xC3 };
-                WriteProcessMemory(pi.hProcess, (LPVOID)ldrIfeoAddr, patch, sizeof(patch), nullptr);
-                FlushInstructionCache(pi.hProcess, (LPVOID)ldrIfeoAddr, sizeof(patch));
-                singleStepThreadId = 0;
-                continueStatus = DBG_CONTINUE;
             } else {
                 continueStatus = DBG_EXCEPTION_NOT_HANDLED;
             }
